@@ -498,13 +498,39 @@ class S350Driver(NetworkDriver):
 
             cidr = line_elems[0]
             interface = line_elems[1]
-
+            # NEW: handle variants where IP and netmask are separate columns; skip unassigned
+            if isinstance(cidr, str) and cidr.lower() == "unassigned":
+                continue
+            if "/" not in cidr:
+                # try to find a dotted netmask in any other parsed field
+                for idx, val in line_elems.items():
+                    if idx in (0, 1, len(line_elems) - 1):
+                        continue  # skip interface and status fields
+                    if re.match(r"^\d{1,3}(?:\.\d{1,3}){3}$", val):
+                        cidr = f"{cidr}/{val}"
+                        break
             ip = netaddr.IPNetwork(cidr)
             family = "ipv{0}".format(ip.version)
 
             interface = canonical_interface_name(interface)
 
             interfaces[interface] = {family: {str(ip.ip): {"prefix_length": ip.prefixlen}}}
+
+        # NEW: Fallback for firmware where 'show ip interface' omits VLAN SVIs
+        if not interfaces:
+            run_conf = self._send_command("show running-config")
+            for m in re.finditer(
+                r"(?mis)^interface\s+vlan\s+(\d+).*?\n\s+ip\s+address\s+(\d+\.\d+\.\d+\.\d+)\s+(\d+\.\d+\.\d+\.\d+)",
+                run_conf,
+            ):
+                vlan_id, ipaddr, mask = m.groups()
+                iface = canonical_interface_name(f"Vlan {vlan_id}")
+                net = netaddr.IPNetwork(f"{ipaddr}/{mask}")
+                fam = f"ipv{net.version}"
+                interfaces.setdefault(iface, {}).setdefault(fam, {})[str(net.ip)] = {
+                    "prefix_length": net.prefixlen
+                }
+
 
         return interfaces
 
