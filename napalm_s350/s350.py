@@ -220,6 +220,21 @@ class S350Driver(NetworkDriver):
         return configs
 
     def get_facts(self):
+        """
+        Return NAPALM facts with a correct interface_list that includes SVIs
+        with static IPv4s. All fields have safe defaults (no None).
+        """
+        facts = {
+            "vendor": "Cisco",
+            "model": "",
+            "hostname": "",
+            "fqdn": "",
+            "os_version": "",
+            "serial_number": "",
+            "uptime": 0,
+            "interface_list": [],
+        }
+
         """Return a set of facts from the device."""
         serial_number, fqdn, os_version, hostname, domainname = ("Unknown",) * 5
 
@@ -272,32 +287,109 @@ class S350Driver(NetworkDriver):
         if domainname != "Unknown" and hostname != "Unknown":
             fqdn = "{0}.{1}".format(hostname, domainname)
 
-        # interface_list
+        # ---- hostname/model/os/serial/uptime (best-effort) ----
+        facts["fqdn"] = str(fqdn)
+        facts["hostname"] = str(hostname)
+        facts["model"] = str(model)
+        facts["serial_number"] = str(serial_number)
+        facts["os_version"] = str(os_version)
+        facts["uptime"] = float(uptime)
 
-        interfaces: List[str] = []
-        show_int_st = show_int_st.strip()
-        # remove the header information
-        show_int_st = re.sub(
-            r"(^-.*$|^Port .*$|^Ch .*$)|^\s.*$|^.*Flow.*$", "", show_int_st, flags=re.M
-        )
-        for line in show_int_st.splitlines():
-            if not line:
+        # ---- Build interface_list from "show interfaces status" ----
+        # NEW: merge SVIs that have a static IPv4 configured
+        try:
+            run_conf = self._send_command("show running-config")
+        except Exception:
+            run_conf = ""
+        interfaces = []
+        try:
+            show_int_st = self._send_command("show interfaces status")
+        except Exception:
+            show_int_st = ""
+
+        if show_int_st:
+            show_int_st = show_int_st.strip()
+            # remove the header information (your existing pattern)
+            show_int_st = re.sub(
+                r"(^-.*$|^Port .*$|^Ch .*$)|^\s.*$|^.*Flow.*$", "", show_int_st, flags=re.M
+            )
+            # NEW: drop any residual device prompts like "HOSTNAME#" or "HOSTNAME>"
+            show_int_st = re.sub(r"(?m)^[^\n]*[>#]\s*$", "", show_int_st)
+            for line in filter(None, (ln.strip() for ln in show_int_st.splitlines())):
+                cols = re.split(r"\s{2,}|\t+", line)
+                if not cols:
+                    continue
+                port = cols[0].strip()
+                if port and not port.lower().startswith(("port", "ch")):
+                    interfaces.append(port)
+
+        # ---- Pre-scan SVIs WITH static IPs and merge to interface_list ----
+        svi_candidates = []
+        if run_conf:
+            for m in re.finditer(r"(?mis)^interface\s+vlan\s+(\d+)(.*?)(?=^\S|\Z)", run_conf):
+                vlan_id, body = m.groups()
+                if re.search(
+                    r"(?mi)^\s*ip\s+address\s+\d+\.\d+\.\d+\.\d+\s+\d+\.\d+\.\d+\.\d+(?!\s+dhcp)",
+                    body,
+                ):
+                    svi_candidates.append(f"Vlan{vlan_id}")
+
+        # Normalize VLAN names already in list, add missing SVI candidates, dedupe
+        interfaces = [re.sub(r"(?i)^vlan\s*(\d+)$", r"Vlan\1", name) for name in interfaces]
+        for svi in svi_candidates:
+            if svi not in interfaces:
+                interfaces.append(svi)
+
+        # NEW: normalize names, drop prompts/empties, canonicalize, and dedupe
+        cleaned: List[str] = []
+        seen = set()
+        for name in interfaces:
+            if not name:
                 continue
-            interface = line.split()[0]
-            interface = canonical_interface_name(interface)
+            # Skip any prompt-like leftovers defensively
+            if re.match(r"^[A-Za-z0-9_.:-]+[>#]$", name):
+                continue
+            n = name.strip()
+            # Normalize "Vlan 1200" -> "Vlan1200"
+            n = re.sub(r"(?i)^vlan\s*(\d+)$", r"Vlan\1", n)
+            try:
+                n = canonical_interface_name(n)
+            except Exception:
+                pass
+            if n not in seen:
+                seen.add(n)
+                cleaned.append(n)
+        interfaces = cleaned
 
-            interfaces.append(str(interface))
 
-        return {
-            "fqdn": str(fqdn),
-            "hostname": str(hostname),
-            "interface_list": interfaces,
-            "model": str(model),
-            "os_version": str(os_version),
-            "serial_number": str(serial_number),
-            "uptime": float(uptime),
-            "vendor": "Cisco",
-        }
+        # NEW: merge SVIs that have a static IPv4 configured
+        try:
+            run_conf = self._send_command("show running-config")
+        except Exception:
+            run_conf = ""
+
+        if run_conf:
+            for m in re.finditer(r"(?mis)^interface\s+vlan\s+(\d+)(.*?)(?=^\S|\Z)", run_conf):
+                vlan_id, body = m.groups()
+                # include ONLY if static ipv4 present (skip DHCP/unconfigured)
+                if not re.search(
+                    r"(?mi)^\s*ip\s+address\s+\d+\.\d+\.\d+\.\d+\s+\d+\.\d+\.\d+\.\d+(?!\s+dhcp)",
+                    body,
+                ):
+                    continue
+                svi = f"Vlan{vlan_id}"
+                if svi not in interfaces:
+                    interfaces.append(svi)
+
+        facts["interface_list"] = interfaces
+
+        # Final sanitize: ensure no None anywhere in facts
+        for k, v in list(facts.items()):
+            if v is None:
+                facts[k] = "" if k in ("vendor", "model", "hostname", "fqdn", "os_version", "serial_number") else 0
+
+        return facts
+
 
     def _get_facts_hostname_from_config(self, show_running):
         # special case for SG500 fw v1.4.x
@@ -408,131 +500,310 @@ class S350Driver(NetworkDriver):
 
     def get_interfaces(self):
         """
-        get_interfaces() implementation for S350
+        Return a dict keyed by interface name with attributes:
+        is_up, is_enabled, description, mac_address, speed, mtu, last_flapped.
+        Includes ONLY VLAN SVIs that have a static IPv4 configured.
+        Never returns None for any field.
         """
         interfaces = {}
 
-        show_status_output = self._send_command("show interfaces status")
-        show_description_output = self._send_command("show interfaces description")
+        # ---- Physical/logical ports from "show interfaces status" (best-effort) ----
+        try:
+            show_status_output = self._send_command("show interfaces status")
+        except Exception:
+            show_status_output = ""
 
-        # by documentation SG350
-        show_jumbo_frame = self._send_command("show ports jumbo-frame")
-        match = re.search(r"Jumbo frames are enabled", show_jumbo_frame, re.M)
-        if match:
-            mtu = 9000
-        else:
+        try:
+            show_description_output = self._send_command("show interfaces description")
+        except Exception:
+            show_description_output = ""
+
+        # MTU (SG/CBS variants expose jumbo setting via this command)
+        try:
+            show_jumbo_frame = self._send_command("show ports jumbo-frame")
+            mtu = 9000 if re.search(r"Jumbo frames are enabled", show_jumbo_frame, re.M) else 1518
+        except Exception:
             mtu = 1518
 
-        mac = "0"
+        mac_cache = ""
 
         for status_line in show_status_output.splitlines():
-            if "Up" in status_line or "Down" in status_line:
-                if "Po" in status_line:
+            if "Up" not in status_line and "Down" not in status_line:
+                continue
+
+            # Some firmwares shorten Po* lines
+            if "Po" in status_line:
+                try:
                     interface, _, _, speed, _, _, link_state = status_line.split()
-                else:
+                except ValueError:
+                    continue
+            else:
+                try:
                     interface, _, _, speed, _, _, link_state, _, _ = status_line.split()
+                except ValueError:
+                    continue
 
-                # Since the MAC address for all the local ports are equal, get the address
-                # from the first port and use it everywhere.
-                if mac == "0":
+            # Retrieve a chassis/port MAC once; many CBS share same local MAC across ports
+            if not mac_cache:
+                try:
                     show_system_output = self._send_command("show lldp local " + interface)
-                    mac = show_system_output.splitlines()[0].split(":", maxsplit=1)[1].strip()
+                    # Typical first line: "Local Port ID: 70:10:6F:AA:BB:CC"
+                    first = show_system_output.splitlines()[0]
+                    mac_cache = first.split(":", maxsplit=1)[1].strip()
+                except Exception:
+                    mac_cache = ""
 
-                if speed == "--":
-                    is_enabled = False
-                    speed = 0
-                else:
-                    is_enabled = True
-                    speed = int(speed)
+            if speed == "--":
+                is_enabled = False
+                speed_val = 0
+            else:
+                is_enabled = True
+                try:
+                    speed_val = int(speed)
+                except Exception:
+                    msp = re.search(r"(\d+)", speed)
+                    speed_val = int(msp.group(1)) if msp else 0
 
-                is_up = link_state == "Up"
+            is_up = (link_state == "Up")
 
-                for descr_line in show_description_output.splitlines():
-                    description = 0
-                    if descr_line.startswith(interface):
-                        description = " ".join(descr_line.split()[1:])
-                        break
+            # description (from "show interfaces description")
+            description = ""
+            for descr_line in show_description_output.splitlines():
+                if descr_line.startswith(interface):
+                    parts = descr_line.split()
+                    if len(parts) > 1:
+                        description = " ".join(parts[1:])
+                    break
 
-                # last_flapped can not be get - setting to default
-                entry = {
-                    "is_up": is_up,
-                    "is_enabled": is_enabled,
-                    "speed": float(speed),
-                    "mtu": mtu,
-                    "last_flapped": -1.0,
-                    "description": description,
-                    "mac_address": napalm.base.helpers.mac(mac),
-                }
-
-                interface = canonical_interface_name(interface)
-
-                interfaces[interface] = entry
-
-        return interfaces
-
-    def get_interfaces_ip(self):
-        """Returns all configured interface IP addresses."""
-        interfaces = {}
-        show_ip_int = self._send_command("show ip interface")
-
-        header = True  # cycle trought header
-        for line in show_ip_int.splitlines():
-            if header:
-                # last line of first header
-                match = re.match(r"^---+ -+ .*$", line)
-                if match:
-                    header = False
-                    fields_end = self._get_ip_int_fields_end(line)
-                continue
-
-            # next header, stop processing text
-            if re.match(r"^---+ -+ .*$", line):
-                break
-
-            line_elems = self._get_ip_int_line_to_fields(line, fields_end)
-
-            # only valid interfaces
-            # in diferent firmwares there is 'Status' field allwais on last place
-            if line_elems[len(line_elems) - 1] != "Valid":
-                continue
-
-            cidr = line_elems[0]
-            interface = line_elems[1]
-            # NEW: handle variants where IP and netmask are separate columns; skip unassigned
-            if isinstance(cidr, str) and cidr.lower() == "unassigned":
-                continue
-            if "/" not in cidr:
-                # try to find a dotted netmask in any other parsed field
-                for idx, val in line_elems.items():
-                    if idx in (0, 1, len(line_elems) - 1):
-                        continue  # skip interface and status fields
-                    if re.match(r"^\d{1,3}(?:\.\d{1,3}){3}$", val):
-                        cidr = f"{cidr}/{val}"
-                        break
-            ip = netaddr.IPNetwork(cidr)
-            family = "ipv{0}".format(ip.version)
+            entry = {
+                "is_up": bool(is_up),
+                "is_enabled": bool(is_enabled),
+                "speed": float(speed_val),
+                "mtu": mtu,
+                "last_flapped": 0.0,
+                "description": description or "",
+                "mac_address": (mac_cache or ""),
+            }
 
             interface = canonical_interface_name(interface)
+            interfaces[interface] = entry
 
-            interfaces[interface] = {family: {str(ip.ip): {"prefix_length": ip.prefixlen}}}
-
-        # NEW: Fallback for firmware where 'show ip interface' omits VLAN SVIs
-        if not interfaces:
+        # ---- Supplement VLAN SVIs from running-config (ONLY those with static IPv4) ----
+        try:
             run_conf = self._send_command("show running-config")
-            for m in re.finditer(
-                r"(?mis)^interface\s+vlan\s+(\d+).*?\n\s+ip\s+address\s+(\d+\.\d+\.\d+\.\d+)\s+(\d+\.\d+\.\d+\.\d+)",
-                run_conf,
-            ):
-                vlan_id, ipaddr, mask = m.groups()
-                iface = canonical_interface_name(f"Vlan {vlan_id}")
-                net = netaddr.IPNetwork(f"{ipaddr}/{mask}")
-                fam = f"ipv{net.version}"
-                interfaces.setdefault(iface, {}).setdefault(fam, {})[str(net.ip)] = {
-                    "prefix_length": net.prefixlen
-                }
+        except Exception:
+            run_conf = ""
 
+        if run_conf:
+            for m in re.finditer(r"(?mis)^interface\s+vlan\s+(\d+)(.*?)(?=^\S|\Z)", run_conf):
+                vlan_id, body = m.groups()
+                # Only include if static IPv4 configured (skip DHCP-only/unconfigured)
+                if not re.search(
+                    r"(?mi)^\s*ip\s+address\s+\d+\.\d+\.\d+\.\d+\s+\d+\.\d+\.\d+\.\d+(?!\s+dhcp)",
+                    body,
+                ):
+                    continue
+
+                iface = f"Vlan{vlan_id}"
+                admin_up = not re.search(r"(?mi)^\s*shutdown\b", body)
+                d_m = re.search(r"(?mi)^\s*name\s+(.+)$", body)
+                desc = d_m.group(1).strip() if d_m else ""
+
+                if iface not in interfaces:
+                    interfaces[iface] = {
+                        "is_up": bool(admin_up),
+                        "is_enabled": bool(admin_up),
+                        "speed": float(0),
+                        "mtu": mtu,
+                        "last_flapped": 0.0,
+                        "description": desc,
+                        "mac_address": "",
+                    }
+                else:
+                    # sanitize/enrich
+                    if interfaces[iface].get("description") in (None, 0):
+                        interfaces[iface]["description"] = desc or ""
+                    if interfaces[iface].get("mac_address") is None:
+                        interfaces[iface]["mac_address"] = ""
+                    if interfaces[iface].get("speed") is None:
+                        interfaces[iface]["speed"] = float(0)
+                    if interfaces[iface].get("last_flapped") is None:
+                        interfaces[iface]["last_flapped"] = 0.0
+
+        # Final sanitize: ensure no None values
+        for _if, _d in interfaces.items():
+            if _d.get("description") is None:
+                _d["description"] = ""
+            if _d.get("mac_address") is None:
+                _d["mac_address"] = ""
+            if _d.get("speed") is None:
+                _d["speed"] = float(0)
+            if _d.get("last_flapped") is None:
+                _d["last_flapped"] = 0.0
 
         return interfaces
+
+
+    def get_interfaces_ip(self):
+        """
+        Returns all configured interface IP addresses.
+        Normalizes SVI names to Vlan<ID>.
+        Ignores 'unassigned' and DHCP-only SVIs.
+        Builds prefix from mask when split across columns.
+        """
+        interfaces = {}
+
+        # Helper to add IPv4 safely
+        def _add_ipv4(ifname, ip, mask):
+            if not ifname or not ip or not mask:
+                return
+            if re.match(r"(?i)^vlan\s*\d+$", ifname):
+                ifname = re.sub(r"(?i)^vlan\s*(\d+)$", r"Vlan\1", ifname)
+            try:
+                net = netaddr.IPNetwork(f"{ip}/{mask}")
+            except Exception:
+                return
+            fam = f"ipv{net.version}"
+            interfaces.setdefault(ifname, {}).setdefault(fam, {})
+            interfaces[ifname][fam].setdefault(str(net.ip), {"prefix_length": net.prefixlen})
+
+        # Parse concise/brief table if available
+        try:
+            show_ip_int = self._send_command("show ip interface")
+        except Exception:
+            show_ip_int = ""
+
+        # Also grab running-config for masks (and fallback)
+        try:
+            run_conf = self._send_command("show running-config")
+        except Exception:
+            run_conf = ""
+
+        # Build mask index from running-config
+        masks_by_if = {}
+        if run_conf:
+            for m in re.finditer(r"(?mis)^interface\s+(\S+\s*\d+)(.*?)(?=^\S|\Z)", run_conf):
+                ifname_raw, body = m.groups()
+                ifname = ifname_raw.strip()
+                if re.match(r"(?i)^vlan\s*\d+$", ifname):
+                    ifname = re.sub(r"(?i)^vlan\s*(\d+)$", r"Vlan\1", ifname)
+                ipm = re.search(
+                    r"(?mi)^\s*ip\s+address\s+(\d+\.\d+\.\d+\.\d+)\s+(\d+\.\d+\.\d+\.\d+)(?!\s+dhcp)",
+                    body,
+                )
+                if ipm:
+                    masks_by_if[ifname] = ipm.groups()
+
+        # Parse the table-style output using existing helpers (fields_end & line_to_fields)
+        if show_ip_int:
+            header = True
+            for line in show_ip_int.splitlines():
+                if header:
+                    if re.match(r"^---+ -+ .*$", line):
+                        header = False
+                        fields_end = self._get_ip_int_fields_end(line)
+                    continue
+
+                if re.match(r"^---+ -+ .*$", line):
+                    break
+
+                line_elems = self._get_ip_int_line_to_fields(line, fields_end)
+                # Only 'Valid' rows (firmware dependent; last column is status)
+                if line_elems[len(line_elems) - 1] != "Valid":
+                    continue
+
+                cidr = line_elems[0]
+                ifname = line_elems[1]
+
+                # Skip unassigned
+                if isinstance(cidr, str) and cidr.lower() == "unassigned":
+                    continue
+
+                # Normalize VLAN name
+                if re.match(r"(?i)^vlan\s*\d+$", ifname):
+                    ifname = re.sub(r"(?i)^vlan\s*(\d+)$", r"Vlan\1", ifname)
+
+                # If no '/', try to locate a dotted netmask among the parsed fields
+                mask = None
+                if "/" not in cidr:
+                    for idx, val in line_elems.items():
+                        if idx in (0, len(line_elems) - 1):
+                            continue  # skip IP and Status
+                        if re.match(r"^\d{1,3}(?:\.\d{1,3}){3}$", val):
+                            mask = val
+                            break
+                    if mask:
+                        ip_only = cidr
+                        _add_ipv4(ifname, ip_only, mask)
+                        continue
+                    # Fall back to running-config mask index if same IP found there
+                    if ifname in masks_by_if and masks_by_if[ifname][0] == cidr:
+                        _add_ipv4(ifname, masks_by_if[ifname][0], masks_by_if[ifname][1])
+                        continue
+
+                # If CIDR contains '/', try to parse directly
+                try:
+                    ipnet = netaddr.IPNetwork(cidr)
+                    fam = f"ipv{ipnet.version}"
+                    interfaces.setdefault(ifname, {}).setdefault(fam, {})
+                    interfaces[ifname][fam].setdefault(str(ipnet.ip), {"prefix_length": ipnet.prefixlen})
+                except Exception:
+                    pass  # ignore malformed lines
+
+        # Fallback/supplement: add SVI static IPv4s from running-config
+        if run_conf:
+            for m in re.finditer(r"(?mis)^interface\s+vlan\s+(\d+)(.*?)(?=^\S|\Z)", run_conf):
+                vlan_id, body = m.groups()
+                ipm = re.search(
+                    r"(?mi)^\s*ip\s+address\s+(\d+\.\d+\.\d+\.\d+)\s+(\d+\.\d+\.\d+\.\d+)(?!\s+dhcp)",
+                    body,
+                )
+                if not ipm:
+                    continue
+                ipaddr, mask = ipm.groups()
+                _add_ipv4(f"Vlan{vlan_id}", ipaddr, mask)
+
+        return interfaces
+
+
+
+    # Get VLANS
+    def get_vlans(self):
+        """
+        Return VLAN dict keyed by VLAN ID:
+        { 1200: { "name": "MGMT_n", "interfaces": ["GigabitEthernet1/0/1", ...] }, ... }
+        Robust against platform differences; returns {} on parse/command failure.
+        """
+        vlans: Dict[int, Dict[str, Any]] = {}
+        try:
+            out = self._send_command("show vlan brief")
+        except Exception:
+            try:
+                out = self._send_command("show vlan")
+            except Exception:
+                return {}  # fail safe
+
+        try:
+            # Typical CBS output has lines like:
+            # "1200   MGMT_n      Active    Gi1/0/1,Gi1/0/2"
+            for line in out.splitlines():
+                line = line.strip()
+                m = re.match(r'^(\d+)\s+(\S+)\s+\S+(?:\s+|$)(.*)$', line)
+                if not m:
+                    continue
+                vid, name, ports = m.groups()
+                vid = int(vid)
+                # normalize port list (optional; empty list if none)
+                if ports and not ports.lower().startswith("po"):
+                    ifaces = [p.strip() for p in re.split(r'[,\s]+', ports) if p.strip()]
+                else:
+                    ifaces = []
+                vlans[vid] = {"name": name, "interfaces": ifaces}
+        except Exception:
+            # If parsing fails, don't break discovery
+            return {}
+
+        return vlans
 
     def _get_ip_int_line_to_fields(self, line, fields_end):
         """dynamic fields lenghts"""
